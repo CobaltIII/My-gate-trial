@@ -1,5 +1,103 @@
 import streamlit as st
 from datetime import datetime
+import asyncio
+import asyncpg
+import os
+from dotenv import load_dotenv
+import nest_asyncio
+import random
+import string
+import time
+from datetime import datetime
+import pandas as pd
+
+nest_asyncio.apply()
+load_dotenv()
+
+DB_URL = os.getenv("URI")
+db_pool = None
+
+if "activity_log" not in st.session_state:
+    st.session_state.activity_log = [
+        "You logged in!"
+    ]
+
+
+async def connect_to_db():
+    global db_pool
+    if not db_pool:
+        db_pool = await asyncpg.create_pool(dsn=DB_URL)
+
+async def disconnect_from_db():
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+
+async def get_connection():
+    global db_pool
+    return await db_pool.acquire()
+
+async def get_service_orders(house_number):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT S.Service_Name, R.Order_ID, R.Date, R.Time, R.Delivery_Status
+            FROM Resident_Orders_Service R
+            JOIN Services S ON R.Service_ID = S.Service_ID
+            WHERE R.House_Number = $1
+            ORDER BY R.Date DESC, R.Time DESC
+        """, house_number)
+        return rows
+
+
+def generate_passkey():
+    digits = ''.join(random.choices(string.digits, k=6))
+    return digits
+
+async def get_visitors():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT Visitor_Name, Visit_Purpose,phone_number
+            FROM Visitor
+            ORDER BY Visitor_Name
+        """)
+        return rows
+
+def add_log(message):
+    timestamp = datetime.now().strftime("%I:%M %p")
+    st.session_state.activity_log.insert(0, f"{timestamp} {message}")
+
+async def get_activity_log():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT Activity_Description, Timestamp
+            FROM Activity_Log
+            WHERE House_Number = $1
+            ORDER BY Timestamp DESC
+        """, 3001)
+        return rows
+
+async def get_cars(house_number):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT registration_number,model, parking_spot_number
+            FROM Car
+            WHERE resident_house_number = $1
+        """, house_number)
+        return rows
+
+async def get_booked_amenities(house_number):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+        SELECT A.Amenity_Name, R.Booking_Date, R.Start_Time, R.End_Time, R.Number_of_people
+        FROM Resident_Books_Amenity R
+        JOIN Amenities A ON A.Amenity_ID = R.Amenity_ID
+        WHERE R.House_Number = $1
+    """, house_number)
+        return rows
+
+
+# Run once when app starts
+asyncio.run(connect_to_db())
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="SmartGate Dashboard", layout="wide")
@@ -8,7 +106,7 @@ st.set_page_config(page_title="SmartGate Dashboard", layout="wide")
 with st.container():
     cols = st.columns([2, 8, 2])
     with cols[0]:
-        st.markdown("### 🚪 SmartGate")
+        st.markdown("### SmartGate")
     with cols[1]:
         st.markdown(f"**{datetime(2024, 4, 24, 12, 0).strftime('%B %d, %Y %I:%M %p')}**")
     with cols[2]:
@@ -36,45 +134,76 @@ col1, col2 = st.columns(2)
 with col1:
     st.markdown("### Add Visitor")
     visitor_name = st.text_input("Visitor Name")
-    visit_time = st.text_input("Date/Time of Visit")
+    visit_date = st.date_input("Date of Visit")
     purpose = st.text_input("Purpose")
-    st.text_input("Passkey", value="498172", disabled=True)
-    st.button("Submit")
+    st.text_input("Passkey", value=str(generate_passkey()), disabled=True)
 
-    st.markdown("### Booked Amenities")
-    st.table({
-        "Amenity": ["Gym"],
-        "Date": ["April 26"],
-        "Time Slot": ["10:00 AM - 11:00 AM"],
-        "No. of People": [1]
-    })
+    if st.button("Submit") and visitor_name and purpose:
+        full_visit_time = visit_date
+        visit_id = (
+            full_visit_time.year
+            + full_visit_time.month
+            + full_visit_time.day
+        )
+
+        async def add_visitor():
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO Visitor (Visitor_ID, Visitor_Name, Phone_Number, Has_Passkey, Visit_Purpose)
+                    VALUES ($1, $2, $3, $4, $5)
+                """, visit_id, visitor_name, "9876543210", True, purpose)
+
+        asyncio.get_event_loop().run_until_complete(add_visitor())
+        add_log(f"Visitor added: **{visitor_name}**")
+        st.success("Visitor added to the system.")
+
+    bookings = asyncio.get_event_loop().run_until_complete(get_booked_amenities(3001))
+
+    if bookings:
+        df_amenities = pd.DataFrame([dict(row) for row in bookings])
+        df_amenities.columns = ["Amenity", "Date", "Start", "End", "People"]
+        
+        st.markdown("### Booked Amenities")
+        st.table(df_amenities)
 
     st.markdown("### My Cars")
-    st.image("https://static.vecteezy.com/system/resources/previews/003/694/243/non_2x/car-icon-in-flat-style-simple-traffic-icon-free-vector.jpg", width=80)
-    st.text("XV2 1234")
+
+    cars = asyncio.get_event_loop().run_until_complete(get_cars(3001))
+
+    if cars:
+        df_cars = pd.DataFrame([dict(row) for row in cars])
+        df_cars.columns = ["Registration Number", "Model", "Parking Spot"]
+        st.table(df_cars)   
+    else:
+        st.info("No cars registered.")
 
 with col2:
     st.markdown("### My Visitors")
-    st.markdown("[Add Visitor](#)")
-    st.button("Order Service", key="order_service_button1")
-    st.table({
-        "Order ID": [1024, 1023],
-        "Date": ["Apr 23, 2024", "Apr 23, 2024"],
-        "Status": ["Completed", "Pending"]
-    })
+    visitors = asyncio.get_event_loop().run_until_complete(get_visitors())
+    df_visitors = pd.DataFrame(visitors)
+    df_visitors.columns = ["Visitor Name", "Visit Purpose", "Phone Number"]
+
+    st.markdown("### My Visitors")
+    st.table(df_visitors)  # Automatically removes index styling
 
     st.markdown("### Service Orders")
-    st.button("Order Service", key="order_service_button2")
-    st.table({
-        "Order ID": [1024, 1023],
-        "Service": ["Laundry", "Cleaning"],
-        "Status": ["Completed", "Pending"]
-    })
+
+    orders = asyncio.get_event_loop().run_until_complete(get_service_orders(3001))
+
+    if orders:
+        order_data = [{
+            "Order ID": row["order_id"],
+            "Service": row["service_name"],
+            "Date": row["date"].strftime("%b %d, %Y"),
+            "Time": row["time"].strftime("%I:%M %p"),
+            "Status": row["delivery_status"]
+        } for row in orders]
+        st.table(order_data)
+    else:
+        st.info("No service orders found.")
+
+    st.button("Order Service", key="order_service_button")
 
     st.markdown("### Activity Log")
-    st.markdown("""
-    - **10:45 AM** Visitor Jane Doe approved  
-    - **09:30 AM** Gym booked: April 26, 2024  
-    - **09:00 AM** Service Order #1024 created
-    """)
-
+    for log_entry in st.session_state.activity_log:
+        st.markdown(f"- {log_entry}")
