@@ -48,7 +48,6 @@ async def get_service_orders(house_number):
         """, house_number)
         return rows
 
-
 def generate_passkey():
     digits = ''.join(random.choices(string.digits, k=6))
     return digits
