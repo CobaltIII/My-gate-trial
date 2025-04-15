@@ -861,6 +861,7 @@ def resident_dashboard():
                     if st.button(f"✅ Approve {v['visitor_name']}", key=f"approve_{v['visitor_id']}"):
                         asyncio.run(approve_passkey(v['visitor_id']))
                         st.success(f"{v['visitor_name']} approved successfully!")
+                        add_log(f"{v['visitor_name']} approved for entry")
                         st.rerun()
 
 
@@ -1010,10 +1011,6 @@ def resident_dashboard():
     for log_entry in st.session_state.activity_log:
         st.markdown(f"- {log_entry}")
 def guard_dashboard():
-    import streamlit as st
-    import asyncio
-    from datetime import datetime
-
     async def get_guard_info(badge_number):
         async with db_pool.acquire() as conn:
             return await conn.fetchrow("""
@@ -1167,6 +1164,446 @@ def guard_dashboard():
     st.markdown("### Activity Log")
     for log_entry in st.session_state.activity_log:
         st.markdown(f"- {log_entry}")
+
+async def get_guards_by_shift():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT shift_timings, COUNT(*) AS count
+            FROM Guard
+            GROUP BY Shift_Timings
+        """)
+        guard_shifts = {row["shift_timings"]: row["count"] for row in rows}
+        return guard_shifts
+
+async def get_owner_count():
+    async with db_pool.acquire() as conn:
+        result = await conn.fetchval("""
+            SELECT COUNT(*)
+            FROM Resident
+            WHERE Status = 'Owner'
+        """)
+        return result
+
+async def get_visitors_with_passkey():
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchval("""
+            SELECT COUNT(*)
+            FROM Visitor
+            WHERE Has_Passkey = TRUE
+        """)
+        return row
+
+async def get_permissions_in_last_x_days(days=7):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT COUNT(*) AS permission_count
+            FROM Permissions
+            WHERE Issue_Time >= NOW() - ($1 * INTERVAL '1 day')
+        """, days)
+        return row["permission_count"]
+
+async def get_most_booked_amenity():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetchrow("""
+            SELECT Amenity_Name, COUNT(*) AS Booking_Count 
+            FROM Resident_Books_Amenity RBA 
+            JOIN Amenities A ON RBA.Amenity_ID = A.Amenity_ID 
+            GROUP BY Amenity_Name 
+            ORDER BY Booking_Count DESC 
+            LIMIT 1; 
+        """)
+        if rows:
+            amenity_name = rows["amenity_name"]
+            booking_count = rows["booking_count"]
+            return {amenity_name: booking_count}
+        return {}
+
+async def get_cars_parked_by_residents():
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(""" 
+            SELECT COUNT(*) AS CarsParked 
+            FROM Car 
+            WHERE Resident_House_Number IS NOT NULL
+        """)
+        return row[0] if row else 0
+
+async def get_services_ordered():
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT COUNT(*) AS ServicesOrdered
+            FROM Resident_Orders_Service
+        """)
+        return row
+
+async def get_average_cost_of_services():
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT AVG(Cost) AS AverageCost
+            FROM Services
+        """)
+        return row
+    
+async def get_guard_tenure_distribution():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT 
+                DATE_PART('year', AGE(current_date, Date_Of_Joining)) AS Years_Of_Service,
+                COUNT(*) AS Guard_Count
+            FROM Guard
+            GROUP BY Years_Of_Service
+            ORDER BY Years_Of_Service DESC
+        """)
+        return rows
+    
+async def get_amenity_usage_trends():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT 
+                a.Amenity_Name,
+                rba.Booking_Date,
+                COUNT(*) AS Booking_Count
+            FROM Resident_Books_Amenity rba
+            JOIN Amenities a ON rba.Amenity_ID = a.Amenity_ID
+            WHERE rba.Booking_Date >= CURRENT_DATE - INTERVAL '30 days'
+            GROUP BY a.Amenity_Name, rba.Booking_Date
+            ORDER BY rba.Booking_Date DESC
+        """)
+        return rows
+    
+async def get_active_residents_count():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT COUNT(DISTINCT House_Number) AS Active_Residents
+            FROM (
+                SELECT House_Number FROM Resident_Books_Amenity 
+                WHERE Booking_Date >= CURRENT_DATE - INTERVAL '30 days'
+                UNION
+                SELECT House_Number FROM Resident_Orders_Service 
+                WHERE Date >= CURRENT_DATE - INTERVAL '30 days'
+            ) AS ActiveRecent
+        """)
+        return rows
+
+async def get_visitors_allowed_by_guards():
+    async with db_pool.acquire() as conn:
+        result = await conn.fetchval("""
+            SELECT COUNT(DISTINCT Visitor_ID)
+            FROM Permissions
+            WHERE Approval_Status = TRUE
+        """)
+        return result
+
+async def get_guard_permission_approvals():
+    async with db_pool.acquire() as conn:
+        result = await conn.fetchrow("""
+            SELECT Guard_Badge_Number AS guard_id, COUNT(*) AS approvals
+            FROM Permissions
+            WHERE Approval_Status = TRUE
+            GROUP BY Guard_Badge_Number
+            ORDER BY approvals DESC
+            LIMIT 1
+        """)
+        return result["guard_id"] if result else None
+
+async def get_pending_approvals_count():
+    async with db_pool.acquire() as conn:
+        result = await conn.fetchval("""
+            SELECT COUNT(*)
+            FROM Permissions
+            WHERE Approval_Status = FALSE
+        """)
+        return result
+
+async def get_live_visitor_count_today():
+    async with db_pool.acquire() as conn:
+        today = datetime.today()
+        result = await conn.fetchval("""
+            SELECT COUNT(DISTINCT Visitor_ID)
+            FROM Log
+            WHERE Date = $1
+        """, today)
+        return result
+##################
+async def get_all_residents():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT *
+            FROM resident;
+        """)
+        if rows:
+            return [dict(row) for row in rows]
+        else:
+            return []
+
+async def get_services_ordered_by_residents():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT R.Owner_Name, S.Service_Name, S.Cost, ROS.Delivery_Status
+            FROM Resident_Orders_Service ROS
+            JOIN Resident R ON ROS.House_Number = R.House_Number
+            JOIN Services S ON ROS.Service_ID = S.Service_ID;
+        """)
+        return [dict(row) for row in rows]
+
+async def get_residents_with_multiple_cars():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT R.Owner_Name, COUNT(C.Car_Number) AS Number_Of_Cars
+            FROM Resident R
+            JOIN Car C ON R.House_Number = C.Resident_House_Number
+            GROUP BY R.Owner_Name
+            HAVING COUNT(C.Car_Number) > 1;
+        """)
+        return [dict(row) for row in rows]
+
+async def get_amenity_booking_counts_per_resident():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT R.Owner_Name, COUNT(RBA.Booking_ID) AS Total_Bookings
+            FROM Resident R
+            JOIN Resident_Books_Amenity RBA ON R.House_Number = RBA.House_Number
+            GROUP BY R.Owner_Name
+            ORDER BY Total_Bookings DESC;
+        """)
+        return [dict(row) for row in rows]
+#######################
+async def get_all_guards():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM Guard;")
+        return [dict(row) for row in rows]
+
+async def get_guards_with_invalid_passkey_checks():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT V.Visitor_Name, G.Guard_Name, GCP.Check_Timestamp
+            FROM Guard_Checks_Passkey GCP
+            JOIN Guard G ON GCP.Guard_ID = G.Badge_Number
+            JOIN Visitor V ON GCP.Visitor_ID = V.Visitor_ID
+            WHERE GCP.Passkey_Status = 'Invalid';
+        """)
+        return [dict(row) for row in rows]
+
+async def get_permissions_requested_by_guard(guard_id=1001):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT P.Permission_ID, P.Issue_Time, P.Approval_Status, R.Owner_Name
+            FROM Permissions P
+            JOIN Guard_Asks_For_Permission GAP ON P.Permission_ID = GAP.Permission_ID
+            JOIN Resident R ON P.Resident_House_Number = R.House_Number
+            WHERE GAP.Guard_ID = $1;
+        """, guard_id)
+        return [dict(row) for row in rows]
+#######################
+async def get_all_amenities():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM Amenities;")
+        return [dict(row) for row in rows]    
+    
+async def get_average_booking_per_amenity():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT a.Amenity_Name, COUNT(rba.Booking_ID) AS Total_Bookings
+            FROM Amenities a
+            LEFT JOIN Resident_Books_Amenity rba ON a.Amenity_ID = rba.Amenity_ID
+            GROUP BY a.Amenity_Name
+            ORDER BY Total_Bookings DESC;
+        """)
+        return [dict(row) for row in rows]
+
+async def get_top_amenity_users():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT r.Owner_Name, COUNT(*) AS Booking_Count
+            FROM Resident_Books_Amenity rba
+            JOIN Resident r ON r.House_Number = rba.House_Number
+            GROUP BY r.Owner_Name
+            ORDER BY Booking_Count DESC
+            LIMIT 5;
+        """)
+        return [dict(row) for row in rows]
+
+async def get_amenity_availability_status():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT Amenity_Name, Availability_Status
+            FROM Amenities;
+        """)
+        return [dict(row) for row in rows]    
+
+def admin_dashboard():
+    st.markdown("## 👩‍💼 Admin Dashboard")
+
+    with st.sidebar:
+        st.markdown("## 🛠 Admin Controls")
+        if st.button("📊 Overview"):
+            st.session_state.admin_section = "overview"
+        if st.button("👥 Manage Residents"):
+            st.session_state.admin_section = "manage_residents"
+        if st.button("🧑‍✈️ Manage Guards"):
+            st.session_state.admin_section = "manage_guards"
+        if st.button("📆 Amenities"):
+            st.session_state.admin_section = "amenities"
+        if st.button("🔓 Logout"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+
+    section = st.session_state.get("admin_section", "overview")
+
+    if section == "overview":
+        st.subheader("🏠 Society Overview")
+    
+        results = asyncio.run(asyncio.gather(
+            get_owner_count(),
+            get_cars_parked_by_residents(),
+            get_guards_by_shift(),
+            get_visitors_with_passkey(),
+            get_most_booked_amenity(),
+            get_visitors_allowed_by_guards(),
+            get_guard_permission_approvals(),
+            get_pending_approvals_count(),
+            get_live_visitor_count_today()
+        ))
+        #
+        (owner_count, cars_parked, guard_shifts, 
+         passkey_visitors, top_amenity, allowed_visitors, top_guard,
+         pending_approvals, live_visitor_count) = results
+
+        # Row 1
+        col1, col2, col3 = st.columns(3)
+        col1.metric("🧑‍🤝‍🧑 Owner Count", owner_count or "0")
+        col2.metric("🚗 Cars Parked by Residents", cars_parked or "0")
+        col3.metric("🛡 Guards on Duty", sum(guard_shifts.values()) if guard_shifts else "0")
+
+        x12, y23 = st.columns([4,20])
+        num_days = x12.number_input("Show permissions in last X days", min_value=1, max_value=30, value=7)
+        t = asyncio.run(get_permissions_in_last_x_days(num_days))
+        y23.metric(f"📋 Permissions in Last {num_days} Days", t or "0")
+
+        col5, col6 = st.columns(2)
+        col5.metric("🛡 Guards by Shift", f"{guard_shifts.get('Day',0)} Day / {guard_shifts.get('Night',0)} Night / {guard_shifts.get('Evening',0)} Evening")
+        col6.metric("✅ Visitors with Passkey", passkey_visitors or "0")
+
+        # Row 3
+        col8, col9 = st.columns(2)
+        col8.metric("👮‍♂️ Visitors Allowed by Guards", allowed_visitors or "0")
+        col9.metric("💪 Top Guard (Approvals)", f"Guard #{top_guard}" if top_guard else "N/A")
+
+        # Row 4
+        col10, col11 = st.columns(2)
+        col10.metric("🆗 Pending Approvals", f"{pending_approvals or 0} Requests")
+        col11.metric("📊 Live Visitor Count (Today)", live_visitor_count or "0")
+
+        col12, col13 = st.columns(2)
+        col12.write("🎯 Most Booked Amenity")
+        col12.table(pd.DataFrame(list(top_amenity.items()), columns=['Amenity Name', 'Booking Count']))
+
+        st.markdown("---")
+        st.info("Use the dashboard to give an overall insight to the residence, use the sidebar for specifics.")
+
+    elif section == "manage_residents":
+        st.subheader("👥 Manage Residents")
+
+        # Run all relevant resident queries asynchronously
+        results = asyncio.run(asyncio.gather(
+            get_all_residents(),                  # Query 2 - Owners count (but now we show all residents)
+            get_services_ordered_by_residents(),  # Query 9
+            get_residents_with_multiple_cars(),   # Query 12
+            get_amenity_booking_counts_per_resident()  # Query 14
+        ))
+
+        all_residents, service_orders, multi_car_residents, amenity_bookings = results
+
+        #print("===================================================")
+        st.markdown("### 🏘 All Residents")
+        st.dataframe(pd.DataFrame(all_residents, columns=["house_number", "owner_name", "phone_number", "move_in_date", "status"]))
+
+        st.markdown("### 📦 Services Ordered by Residents")
+        st.dataframe(pd.DataFrame(service_orders, columns=["owner_name", "service_name", "cost", "delivery_status"]))
+
+        st.markdown("### 🚘 Residents with Multiple Cars")
+        if len(multi_car_residents) == 0:
+            st.write("None")
+        else:
+            st.dataframe(pd.DataFrame(multi_car_residents, columns=["owner_name", "number_of_cars"]))
+
+        st.markdown("### 🏋️ Amenity Bookings by Residents")
+        st.dataframe(pd.DataFrame(amenity_bookings, columns=["owner_name", "total_bookings"]))
+
+    elif section == "manage_guards":
+        st.subheader("🧑‍✈️ Manage Guards")
+    
+        results = asyncio.run(asyncio.gather(
+            get_all_guards(),  # All guards
+            get_guard_tenure_distribution(),  # Tenure
+            get_guards_with_invalid_passkey_checks(),  # Invalid passkey checks
+            get_permissions_requested_by_guard(101)  # Permissions requested by specific guard
+        ))
+    
+        all_guards, tenure_data, invalid_checks, guard_permission_requests = results
+    
+        st.markdown("### 🛡 All Guards")
+        st.dataframe(pd.DataFrame(all_guards, columns=["badge_number", "guard_name", "shift_timings", "date_of_joining", "phone_number"]))
+    
+        st.markdown("### 📅 Guard Tenure Distribution (Years of Service)")
+        if len(tenure_data):
+            df_tenure = pd.DataFrame(tenure_data, columns=["years_of_service", "guard_count"])
+            st.area_chart(df_tenure.set_index("years_of_service"))
+        else:
+            st.write("No tenure data available.")
+    
+        st.markdown("### 🚫 Invalid Passkey Checks by Guards")
+        if invalid_checks:
+            st.dataframe(pd.DataFrame(invalid_checks, columns=["visitor_name", "guard_name", "check_timestamp"]))
+        else:
+            st.write("No invalid passkey checks recorded.")
+    
+        st.markdown("### 📝 Permissions Requested by Guard #1001")
+        if guard_permission_requests:
+            st.dataframe(pd.DataFrame(guard_permission_requests, columns=["permission_id", "issue_time", "approval_status", "owner_name"]))
+        else:
+            st.write("No permission requests by this guard.")
+
+    elif section == "amenities":
+        st.subheader("🏋️ Amenities Overview")
+
+        results = asyncio.run(asyncio.gather(
+            get_all_amenities(),
+            get_amenity_usage_trends(),
+            get_average_booking_per_amenity(),
+            get_top_amenity_users(),
+            get_amenity_availability_status()
+        ))
+
+        all_amenities, usage_trends, average_booking, top_users, availability = results
+
+        st.markdown("### 📋 All Amenities")
+        st.dataframe(pd.DataFrame(all_amenities))
+
+        st.markdown("### 📈 Amenity Usage in Last 30 Days")
+        df_trend = pd.DataFrame(usage_trends)
+        if not df_trend.empty:
+            df_trend.columns = ["amenity_name", "booking_date", "booking_count"]  # Rename the columns
+            df_trend["booking_date"] = pd.to_datetime(df_trend["booking_date"])  # Convert to datetime
+            df_pivot = df_trend.pivot_table(
+                index="booking_date",
+                columns="amenity_name",
+                values="booking_count",
+                aggfunc="sum"
+            ).fillna(0)
+            st.area_chart(df_pivot)
+        else:
+            st.write("No recent bookings.")
+
+        coll1, coll2 = st.columns(2)
+        coll1.markdown("### 📊 Average Booking Count per Amenity")
+        coll1.dataframe(pd.DataFrame(average_booking, columns=["amenity_name", "total_bookings"]))
+
+        coll2.markdown("### 👑 Top Amenity Users")
+        coll2.dataframe(pd.DataFrame(top_users, columns=["owner_name", "booking_count"]))
+
+        st.markdown("### ✅ Amenity Availability Status")
+        st.dataframe(pd.DataFrame(availability, columns=["amenity_name", "availability_status"]))
         
 if page == "resident" and st.session_state.logged_in:
     resident_dashboard()
@@ -1174,38 +1611,55 @@ if page == "resident" and st.session_state.logged_in:
 elif page == "guard" and st.session_state.logged_in:
     guard_dashboard()
     st.stop()
-    
+elif page == "Admin" and st.session_state.logged_in:
+    admin_dashboard()
+    st.stop()
+
+
+
 # LOGIN SECTION
 if not st.session_state.logged_in:
     st.title("🔐 Login to SmartGate")
 
-    user_type = st.selectbox("Login as", ["Resident", "Guard"])
-    user_id = st.text_input("Enter House Number" if user_type == "Resident" else "Enter Badge Number")
-    password = st.text_input("Enter Password", type="password")
-
-    if st.button("Login"):
-        if password != "1234":
-            st.error("Incorrect password.")
-        elif not user_id.strip().isdigit():
-            st.error("Please enter a valid numeric ID.")
-        else:
-            user_id = int(user_id.strip())
-            if user_type == "Resident":
-                if asyncio.run(is_valid_resident(user_id)):
-                    st.session_state.logged_in = True
-                    st.session_state.user_type = "Resident"
-                    st.session_state.user_id = user_id
-                    st.query_params["page"] = "resident"
-                    st.rerun()
-                else:
-                    st.error("House number not found.")
+    user_type = st.selectbox("Login as", ["Resident", "Guard", "Admin"])
+    if user_type == "Admin":
+        password = st.text_input("Enter Password", type="password")
+        if st.button("Login"):
+            if password != "1234":
+                st.error("Incorrect password.")
             else:
-                if asyncio.run(is_valid_guard(user_id)):
-                    st.session_state.logged_in = True
-                    st.session_state.user_type = "Guard"
-                    st.session_state.user_id = user_id
-                    st.query_params["page"] = "guard"
-                    st.rerun()
+                st.session_state.logged_in = True
+                st.session_state.user_type = "Admin"
+                st.session_state.user_id = "Admin"
+                st.query_params["page"] = "Admin"
+                st.rerun()
+    else:
+        user_id = st.text_input("Enter House Number" if user_type == "Resident" else "Enter Badge Number")
+        password = st.text_input("Enter Password", type="password")
+
+        if st.button("Login"):
+            if password != "1234":
+                st.error("Incorrect password.")
+            elif not user_id.strip().isdigit():
+                st.error("Please enter a valid numeric ID.")
+            else:
+                user_id = int(user_id.strip())
+                if user_type == "Resident":
+                    if asyncio.run(is_valid_resident(user_id)):
+                        st.session_state.logged_in = True
+                        st.session_state.user_type = "Resident"
+                        st.session_state.user_id = user_id
+                        st.query_params["page"] = "resident"
+                        st.rerun()
+                    else:
+                        st.error("House number not found.")
                 else:
-                    st.error("Badge number not found.")
+                    if asyncio.run(is_valid_guard(user_id)):
+                        st.session_state.logged_in = True
+                        st.session_state.user_type = "Guard"
+                        st.session_state.user_id = user_id
+                        st.query_params["page"] = "guard"
+                        st.rerun()
+                    else:
+                        st.error("Badge number not found.")
     st.stop()
