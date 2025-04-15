@@ -1009,40 +1009,54 @@ def resident_dashboard():
     st.markdown("### Activity Log")
     for log_entry in st.session_state.activity_log:
         st.markdown(f"- {log_entry}")
-
 def guard_dashboard():
     import streamlit as st
     import asyncio
-    import asyncpg
     from datetime import datetime
 
     async def get_guard_info(badge_number):
         async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("""
+            return await conn.fetchrow("""
                 SELECT Shift_Timings, Date_Of_Joining
                 FROM Guard
                 WHERE Badge_Number = $1
             """, badge_number)
-            return row
 
     async def get_visitorsGuard():
         async with db_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            return await conn.fetch("""
                 SELECT v.*
                 FROM Visitor v
-                JOIN Permissions o ON v.Visitor_ID = o.Visitor_ID
-                WHERE o.approval_status = TRUE;
+                JOIN Permissions p ON v.Visitor_ID = p.Visitor_ID
+                WHERE p.Approval_Status = TRUE;
             """)
-            return rows
 
     async def get_cars():
         async with db_pool.acquire() as conn:
-            rows = await conn.fetch("""
+            return await conn.fetch("""
                 SELECT *
                 FROM Car
                 ORDER BY Model
             """)
-            return rows
+
+    async def approve_visitor(visitor_id):
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE Permissions
+                SET Approval_Status = TRUE
+                WHERE Visitor_ID = $1
+            """, visitor_id)
+            await conn.execute("""
+                INSERT INTO log (date, time, visitor_id, car_id)
+                VALUES (CURRENT_DATE, CURRENT_TIME, $1, NULL)
+            """, visitor_id)
+
+    async def log_car_approval(car_number):
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO log (date, time, visitor_id, car_id)
+                VALUES (CURRENT_DATE, CURRENT_TIME, NULL, $1)
+            """, car_number)
 
     async def request_visitor_permission(visitor_name, phone_number, purpose, house_number, badge_number):
         async with db_pool.acquire() as conn:
@@ -1050,53 +1064,40 @@ def guard_dashboard():
             date_part = full_visit_time.strftime("%Y%m%d")
             time_suffix = str(int(full_visit_time.timestamp() * 1000))[-4:]
             visitor_id = int(date_part + time_suffix)
-            visitor_id = visitor_id%10000
+            visitor_id = visitor_id % 10000
             permission_id = await generate_unique_permission_id(conn)
             async with conn.transaction():
-                # Step 1: Insert visitor
-                await conn.fetchval("""
+                await conn.execute("""
                     INSERT INTO Visitor (Visitor_id,Visitor_Name, Phone_Number, Has_Passkey, Visit_Purpose)
                     VALUES ($1, $2, $3, $4,$5)
-                """, visitor_id,visitor_name, phone_number, False, purpose)
+                """, visitor_id, visitor_name, phone_number, False, purpose)
 
-                # Step 2: Insert permission request
-                await conn.fetchval("""
+                await conn.execute("""
                     INSERT INTO Permissions (Permission_id, Issue_Time, Approval_Status, Resident_House_Number, Visitor_ID, Guard_Badge_Number)
                     VALUES ($1,CURRENT_TIMESTAMP, FALSE, $2, $3, $4)
-                """, permission_id,house_number, visitor_id, badge_number)
+                """, permission_id, house_number, visitor_id, badge_number)
 
-                # Step 3: Link in Guard_Asks_For_Permission
                 await conn.execute("""
                     INSERT INTO Guard_Asks_For_Permission (Guard_ID, Permission_ID, Request_Timestamp)
                     VALUES ($1, $2, CURRENT_TIMESTAMP)
                 """, badge_number, permission_id)
 
-                # Step 4: Insert into permission_asked_from_resident table
                 await conn.execute("""
                     INSERT INTO permission_asked_from_resident (permission_id, house_number)
                     VALUES ($1, $2)
                 """, permission_id, house_number)
 
-            result = asyncio.run(request_visitor_permission(visitor_name, phone_number, purpose, house_number, badge))
-            st.success(f"Requested permission for visitor {visitor_name} (ID: {result['visitor_id']}) to house {house_number}")
-
-            return {"visitor_id": visitor_id, "permission_id": permission_id}
-
-
-    user_id = st.session_state.user_id
-    badge = user_id
-
-    st.markdown(f"## Hi, Guard {user_id} — Welcome back!")
+    badge = st.session_state.user_id
+    st.markdown(f"## Hi, Guard {badge} — Welcome back!")
 
     if "guard_section" not in st.session_state:
         st.session_state.guard_section = "dashboard"
 
-    # SIDEBAR
     with st.sidebar:
         st.markdown("## 📋 Dashboard")
         if st.button("🏠 Dashboard"):
             st.session_state.guard_section = "dashboard"
-        if st.button("🧑‍🤝‍🧑 My Shifts"):
+        if st.button("🧑‍💼 My Shifts"):
             st.session_state.guard_section = "shifts"
         if st.button("📅 Allow Visitors"):
             st.session_state.guard_section = "allow_visitors"
@@ -1111,7 +1112,6 @@ def guard_dashboard():
                     del st.session_state[key]
             st.rerun()
 
-    # SECTION ROUTING
     section = st.session_state.guard_section
 
     if section == "dashboard":
@@ -1130,23 +1130,10 @@ def guard_dashboard():
         st.markdown("### 📅 Allow Visitors")
         visitors = asyncio.run(get_visitorsGuard())
         search = st.text_input("Search Visitor by Name or Phone")
-        
         for v in visitors:
             if search.lower() in v['visitor_name'].lower() or search in v['phone_number']:
                 st.markdown(f"**{v['visitor_name']}** - {v['phone_number']}")
                 if st.button(f"✅ Allow {v['visitor_name']}", key=v['visitor_id']):
-                    
-                    # Approve the visitor by updating Permissions table
-                    async def approve_visitor(visitor_id):
-                        async with db_pool.acquire() as conn:
-                            # Update the Permission record to set Approval_Status = TRUE
-                            await conn.execute("""
-                                UPDATE Permissions
-                                SET Approval_Status = TRUE
-                                WHERE Visitor_ID = $1
-                            """, visitor_id)
-                    
-                    # Call the function to approve the visitor
                     asyncio.run(approve_visitor(v['visitor_id']))
                     st.success(f"{v['visitor_name']} allowed!")
                     add_log(f"Visitor {v['visitor_name']} approved by Guard {badge}")
@@ -1159,23 +1146,28 @@ def guard_dashboard():
             if search.lower() in c['model'].lower() or search in c['registration_number']:
                 st.markdown(f"**{c['model']}** - {c['registration_number']}")
                 if st.button(f"✅ Allow {c['model']}", key=c['car_number']):
+                    asyncio.run(log_car_approval(c['car_number']))
                     st.success(f"Car {c['model']} allowed!")
+                    add_log(f"Car {c['model']} approved by Guard {badge}")
 
     elif section == "request_permission":
         st.markdown("### 🛠 Request Visitor Permission")
-        
-        # Collect required information
         visitor_name = st.text_input("Visitor Name")
         phone_number = st.text_input("Phone Number")
         purpose = st.text_input("Visit Purpose")
         house_number = st.text_input("House Number")
         st.text_input("Badge Number", value=str(badge), disabled=True)
-        # Button to request permission
         if st.button("📨 Request Permission"):
-            # You need to update the function to take these arguments
             asyncio.run(request_visitor_permission(visitor_name, phone_number, purpose, int(house_number), badge))
             st.success(f"Requested permission for visitor {visitor_name} to house {house_number}")
+            add_log(f"Requested permission for visitor {visitor_name} to house {house_number}")
 
+    # Activity Log (exactly like resident)
+    st.markdown("---")
+    st.markdown("### Activity Log")
+    for log_entry in st.session_state.activity_log:
+        st.markdown(f"- {log_entry}")
+        
 if page == "resident" and st.session_state.logged_in:
     resident_dashboard()
     st.stop()
